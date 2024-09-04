@@ -1,3 +1,6 @@
+原文链接：https://www.sohu.com/a/277984306_654301
+
+
 在阅读Linux内核时，常见到这些宏： __init, __initdata, __initfunc(), asmlinkage, ENTRY(), FASTCALL()等等。
 
 它们定义在 /include/linux/init.h 和 /include/linux/linkage.h 以及其他一些.h文件中。那它们是什么含义呢？今天就来简要说说。
