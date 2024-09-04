@@ -1,0 +1,87 @@
+版权声明：本文为博主原创文章，遵循 CC 4.0 BY-SA 版权协议，转载请附上原文出处链接和本声明。                      
+原文链接：https://blog.csdn.net/weixin_42135087/article/details/107958446
+
+
+
+我们先看一个例子，在driver中，定义下面这一段函数，并加上__setup注册
+
+static int __init skip_initramfs_param(char *str)
+{
+	if (*str)
+		return 0;
+	do_skip_initramfs = 1;
+	return 1;
+}
+__setup("skip_initramfs", skip_initramfs_param);
+
+在开机阶段，当cmdline中有"skip_initramfs"字时，就会调用到skip_initramfs_param()函数
+
+2、__setup宏原理
+如下为__setup的宏定义，作用是在".init.setup"段定义变量
+
+(include/linux/init.h)
+#define __setup_param(str, unique_id, fn, early)			\
+	static const char __setup_str_##unique_id[] __initconst		\
+		__aligned(1) = str; 					\
+	static struct obs_kernel_param __setup_##unique_id		\
+		__used __section(.init.setup)				\
+		__attribute__((aligned((sizeof(long)))))		\
+		= { __setup_str_##unique_id, fn, early }
+
+#define __setup(str, fn)						\
+	__setup_param(str, fn, fn, 0)
+
+
+(vmlinux.lds.h)
+#define INIT_SETUP(initsetup_align)					\
+		. = ALIGN(initsetup_align);				\
+		VMLINUX_SYMBOL(__setup_start) = .;			\
+		*(.init.setup)						\
+		VMLINUX_SYMBOL(__setup_end) = .;
+
+#define INIT_DATA_SECTION(initsetup_align)				\
+	.init.data : AT(ADDR(.init.data) - LOAD_OFFSET) {		\
+		INIT_DATA						\
+		INIT_SETUP(initsetup_align)				\
+		INIT_CALLS						\
+		CON_INITCALL						\
+		SECURITY_INITCALL					\
+		INIT_RAM_FS						\
+	}
+
+3、__setup链接函数的调用
+那么什么时候开始调用__setup注册的函数呢？
+在start_kernel()阶段调用了obsolete_checksetup函数，该函数会依次解析.init.setup的变量中对应的函数。也就是循环调用这些setup函数了
+start_kernel()---->unknown_bootoption()---->obsolete_checksetup()
+
+static bool __init obsolete_checksetup(char *line)
+{
+	const struct obs_kernel_param *p;
+	bool had_early_param = false;
+
+	p = __setup_start;
+	do {
+		int n = strlen(p->str);
+		if (parameqn(line, p->str, n)) {
+			if (p->early) {
+				/* Already done in parse_early_param?
+				 * (Needs exact match on param part).
+				 * Keep iterating, as we can have early
+				 * params and __setups of same names 8( */
+				if (line[n] == '\0' || line[n] == '=')
+					had_early_param = true;
+			} else if (!p->setup_func) {
+				pr_warn("Parameter %s is obsolete, ignored\n",
+					p->str);
+				return true;
+			} else if (p->setup_func(line + n))
+				return true;
+		}
+		p++;
+	} while (p < __setup_end);
+
+	return had_early_param;
+}
+
+
+
