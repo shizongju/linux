@@ -1,0 +1,307 @@
+在阅读Linux内核时，常见到这些宏： __init, __initdata, __initfunc(), asmlinkage, ENTRY(), FASTCALL()等等。
+
+它们定义在 /include/linux/init.h 和 /include/linux/linkage.h 以及其他一些.h文件中。那它们是什么含义呢？今天就来简要说说。
+
+1. __init
+
+位置：
+
+/ include/linux/init.h
+
+定义:
+
+#define__init __attribute__ ((__section__ (".init.text")))
+
+注释：这个标志符和函数声明放在一起，表示gcc编译器在编译时，需要把这个函数放在.text.init Section 中，而这个Section 在内核完成初始化之后，就会被释放掉。
+
+举例：
+
+asmlinkage void__ init star_kerne(void){ ... }
+
+2. __initdata
+
+位置：
+
+/ include/linux/init.h
+
+定义：
+
+#define__initdata __attribute__ ((__section__ (".init.data")))
+
+注释：这个标志符和变量声明放在一起，表示gcc编译器在编译时，需要把这个变量放在.data.init Section中，而这个Section 在内核完成初始化之后，会释放掉。
+
+举例：
+
+staticstructkernel_paramraw_params[] __initdata={... }
+
+3. __initfunc()
+
+位置：
+
+/include/ asm-i386/init.h
+
+定义：
+
+#define__initfunc(__arginit)
+
+__arginit __init;
+
+__arginit
+
+注释：__initfunc() 是一个自定义宏，用来定义一个 __init 函数，在Linux-2.4中已被__init宏所取代。
+
+举例：
+
+__initfunc ( voidmem_init( unsignedlongstart_mem, unsignedlongend_mem)) { ... }
+
+4. asmlinkage
+
+位置：
+
+/ include/linux/linkage.h
+
+定义：
+
+#defineasmlinkage CPP_ASMLINKAGE __attribute__((regparm(0)))
+
+注释：这个标志符和函数声明放在一起，带regparm(0)的属性声明告诉gcc编译器，该函数不需要通过任何寄存器来传递参数，参数只是通过堆栈来传递。gcc编译器在汇编过程中调用c语言函数时传递参数有两种方法：一种是通过堆栈，另一种是通过寄存器。
+
+缺省时采用寄存器，假如你要在你的汇编过程中调用c语言函数，并且想通过堆栈传递参数，你定义的 c 函数时要在函数前加上宏asmlinkage。
+
+举例：
+
+asmlinkage void__ init start_kernel(void){ ... }
+
+5.ENTRY()
+
+位置：
+
+/ include/linux/linkage.h
+
+定义：
+
+#define ENTRY( name)
+
+.globl name;
+
+ALIGN;
+
+name:
+
+注释：将name 声明为全局，对齐，并定义为标号。
+
+6. FASTCALL ()
+
+位置：
+
+/ include/linux/kernel.h
+
+定义：
+
+#defineFASTCALL(x) x __attribute__((regparm(3)))
+
+注释：这个标志符和函数声明放在一起，带regparm(3)的属性声明告诉gcc编译器，这个函数可以通过寄存器传递多达3个的参数，这3个寄存器依次为EAX、EDX 和 ECX。更多的参数才通过堆栈传递。这样可以减少一些入栈出栈操作，因此调用比较快。
+
+举例：
+
+externvoidFASTCALL(__switch_to(structtask_struct *prev, structtask_struct *next))
+
+这个例子中，prev将通过eax，next通过edx传递。
+
+7. __sched
+
+位置：
+
+/ include/linux/sched.h
+
+定义：
+
+/* Attach to any functions which should be ignored in wchan output. */
+
+#define__sched __attribute__((__section__(".sched.text")))
+
+可执行文件的内存布局对程序性能的影响是非常巨大的，因为最近一直在做性能优化，对这方面感触颇深。要搞明白可执行文件的内存布局，就必须得了解编译原理，当然编译原理实在是太过于高深了，我所知也是皮毛，所以我就从最实用的地方开始入手一点点的分析。
+
+就从我前文里提到的__attribute__((section(“.sec_name”)))来说起吧，因为我使用这个东西确实给我们的性能带来了一定的提升。
+
+关于attribute section这个东西，你要google的话，能够搜索出来不少前人的分析，不过实在都是大同小异，你抄我来我抄你，毫无营养。在他们的博客里，无非是说，“将作用的函数或者数据放入指定名为‘.sec_name’ 的输入段”，然后再巴拉巴拉一通什么是输入段，说的你云里雾里一头雾水分不清东西南北顿觉高大上。
+
+那我们就来看下attribute section到底是什么。
+
+要知道attribute section, 就要先理解链接脚本。链接脚本即链接器在把.o文件链接成最后的elf文件所遵循的规则，也就是，最终的可执行文件是什么样子的是由这个链接脚本决定的。
+
+链接脚本的语法和C语言很类似，我们能够很容易读明白，所以从链接脚本来入手分析这个东西会更清晰一些。
+
+对应于 __attribute__((section(“.sec_name”)))这句话，它在链接的时候采取的默认规则是：
+
+.sec_name
+
+{
+
+*(.sec_name)
+
+}
+
+即把.sec_name指向的内容放在.sec_name这个段里面。我们再来稍微清晰化一些，下面举个例子。
+
+voidfoo(void) __attribute__((section(".in_name")));
+
+voidbar(void) __attribute__((section(".in_name")));
+
+我们使用attribute section来声明了两个函数，然后我们在链接脚本里面做如下约束：
+
+.out_name
+
+{
+
+*(.in_name)
+
+}
+
+这样就把foor(),bar()这两个函数给放在了最终elf文件里的.out_name这个section。而如果我们不再链接脚本里做这个约束，那么它在链接过程中就会采用默认规则，即输入段和输出段的名字是一样的：
+
+.in_name
+
+{
+
+*(.in_name)
+
+}
+
+总结起来就是，__attribute__((section(“.in_name”)))的作用是把.in_name指向的符号给放在一起。
+
+唔~ 仍然有点模糊是不？ 那就好好读读《linkers and loaders》或者《程序员的自我修养》这两本书吧。
+
+然后我们来看下linux内核对于attribute section的应用， 以linux kernel的链接脚本vmlinux.lds为例。先来看下linux kernel最终镜像的代码段是如何规划的。
+
+SECTIONS
+
+{
+
+. = VMLINUX _LOAD_ADDRESS;
+
+/ * read-only */
+
+_text = .; / * Text and read-only data */
+
+.text : {
+
+TEXT_TEXT
+
+SCHED_TEXT
+
+LOCK_TEXT
+
+KPROBES_TEXT
+
+IRQENTRY_TEXT
+
+*(.text.*)
+
+*(.fixup)
+
+*(.gnu.warning)
+
+} :text = 0
+
+}
+
+如上就是一个典型的linux kenrel链接脚本的代码段部分。稍微解释下。 . = VMLINUX_LOAD_ADDRESS;的意思是说，此处的地址是VMLINUX_LOAD_ADDRESS，接着又把该值赋给了_text，也就是内核代码段的其实地址是VMLINUX_LOAD_ADDRESS，就这就开始了代码段。
+
+在代码段里面我们可以很明显的看到它划分了TEXT_TEXT、SCHED_TEXT、LOCK_TEXT、KPROBES_TEXT、IRQENTRY_TEXT，这样划分的目的，就是为了合理规划地址空间以提升性能。我们可以看下这几个宏到底表示什么：
+
+#defineTEXT_TEXT ALIGN_FUNCTION(); *(.text.hot) *(.text) *(.ref.text) MEM_KEEP(init.text) MEM_KEEP(exit.text) *(.text.unlikely)
+
+#defineSCHED_TEXT ALIGN_FUNCTION(); VMLINUX_SYMBOL(__sched_text_start) = .; *(.sched.text) VMLINUX_SYMBOL(__sched_text_end) = .;
+
+#defineLOCK_TEXT ALIGN_FUNCTION(); VMLINUX_SYMBOL(__lock_text_start) = .; *(.spinlock.text) VMLINUX_SYMBOL(__lock_text_end) = .;
+
+#defineKPROBES_TEXT ALIGN_FUNCTION(); VMLINUX_SYMBOL(__kprobes_text_start) = .; *(.kprobes.text) VMLINUX_SYMBOL(__kprobes_text_end) = .;
+
+#defineIRQENTRY_TEXT ALIGN_FUNCTION(); VMLINUX_SYMBOL(__irqentry_text_start) = .; *(.irqentry.text) VMLINUX_SYMBOL(__irqentry_text_end) = .;
+
+这些宏其实就是定义了一些input section， 比如.text.hot等。
+
+接着以.sched.text为例来看看到底是怎么用的。
+
+#define__sched __attribute__((__section__(".sched.text")))
+
+void__ sched notrace preempt_schedule_context(void);
+
+staticvoid__sched __schedule( void);
+
+asmlinkage void__ sched schedule(void);
+
+asmlinkage void__ sched schedule_user(void);
+
+void__ sched schedule_preempt_disabled(void);
+
+asmlinkage void__ sched notrace preempt_schedule(void);
+
+asmlinkage void__ sched preempt_schedule_irq(void);
+
+....
+
+一目了然了吧？ 就是前面我们说的attribute section这个东西，内核就是使用了这个东西来规划地址空间，将相互关联的代码给放在一起，以达到提升性能并保持稳定的作用。
+
+因为松柏公司的性能受代码check-in影响波动较大，所以我就想到了使用linux kernel的这种做法来规划可执行文件的地址空间，按照不同模块来划分不同的section，这样来避免频繁code check-in对性能波动的影响。
+
+.text
+
+{
+
+*(.module_a.text)
+
+*(.module_b.text)
+
+*(.module_c.text)
+
+...
+
+}
+
+其实，再稍微的深入思考下，我们就能发现一个更细粒度的控制，那就是控制函数在可执行文件里的先后顺序。
+
+voidfoo(void) __attribute__((section(".in_name.1")));
+
+voidbar(void) __attribute__((section(".in_name.2")));
+
+.text
+
+{
+
+*(.in_name .1)
+
+*(.in_name .2)
+
+...
+
+}
+
+这样做之后，在可执行文件里，foo就会在bar的前面，及foo和bar的地址紧挨着，bar紧跟在foo的后面。我们在缩小一下我们的视角，从宏观上来看下这个链接脚本。
+
+SECTIONS
+
+{
+
+.text : {
+
+...
+
+}
+
+.data : {
+
+...
+
+}
+
+.bss:{
+
+...
+
+}
+
+}
+
+这也是为什么可执行文件的内存布局先是代码段，接着数据段，再是bss段的原因，即链接脚本决定可执行文件的内存布局。
