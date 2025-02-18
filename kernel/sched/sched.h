@@ -148,8 +148,14 @@ extern struct list_head asym_cap_list;
  * increase coverage and consistency always enable it on 64-bit platforms.
  */
 #ifdef CONFIG_64BIT
+ //# define SCHED_FIXEDPOINT_SHIFT 10 在include/linux/sched.h中定义
 # define NICE_0_LOAD_SHIFT	(SCHED_FIXEDPOINT_SHIFT + SCHED_FIXEDPOINT_SHIFT)
+//该宏定义用于将权重 w 右移 SCHED_FIXEDPOINT_SHIFT 位
 # define scale_load(w)		((w) << SCHED_FIXEDPOINT_SHIFT)
+
+//该宏定义用于将权重 w 左移 SCHED_FIXEDPOINT_SHIFT 位, 若小于2则赋值为2
+//({ ... }):
+//这个括号包围的代码块是一个语句表达式。整个块包含了一组完整的 C 语句。这个语法结构允许在块内声明变量、执行各种语句，并能够返回最后一个表达式的值
 # define scale_load_down(w)					\
 ({								\
 	unsigned long __w = (w);				\

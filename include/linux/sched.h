@@ -469,17 +469,46 @@ struct load_weight {
  *
  * Then it is the load_weight's responsibility to consider overflow
  * issues.
+ *
+ * 该结构体通过精细化的时间衰减模型，为多核系统的负载均衡和能效管理提供了关键数据支撑，是Linux内核实现高效资源调度的核心基础设施。
+ * 性能调优参数
+ *参数	    调整路径	                       作用
+ *衰减周期	CONFIG_PELT_HALFLIFE_MS	       默认32ms，值越大历史影响越久
+ *更新间隔	kernel/sched/timer.c	       通过 tick 频率控制
+ *负载阈值	kernel/sched/fair.c	           sd_imbalance_pct 等参数
+ 负载均衡（load_balance）:
+
+典型应用场景：
+1）负载均衡（load_balance）:
+// 内核源码片段 (kernel/sched/fair.c)
+if (env->sd->flags & SD_ASYM_PACKING)
+    update_sg_lb_stats(env, &sgs);
+2）CPU热插拔:
+// 迁移任务时参考负载历史
+select_task_rq_fair(struct task_struct *p, ...)
+3）能效调度（EAS）:
+// 根据util_avg选择能效最优CPU
+find_energy_efficient_cpu()
+
+调试监控方法
+1）查看进程负载指标
+cat /proc/<pid>/sched
+
+2）输出示例：
+se.avg.last_update_time : 1023456789
+se.avg.load_sum         : 583214
+se.avg.util_sum         : 482617
  */
 struct sched_avg {
-	u64				last_update_time;
-	u64				load_sum;
-	u64				runnable_sum;
-	u32				util_sum;
-	u32				period_contrib;
-	unsigned long			load_avg;
-	unsigned long			runnable_avg;
-	unsigned long			util_avg;
-	unsigned int			util_est;
+	u64				last_update_time; //最后一次负载更新的时间戳（ns）
+	u64				load_sum; //∑(Li * yn-i)	衰减累计负载（含权重）
+	u64				runnable_sum; //∑(Ri * yn-i)	衰减累计可运行时间
+	u32				util_sum; //∑(Ui * yn-i)	衰减累计实际利用率
+	u32				period_contrib; //未满1024us的时间窗口贡献值
+	unsigned long			load_avg; //load_sum / LOAD_AVG_MAX	归一化平均负载
+	unsigned long			runnable_avg;//runnable_sum / LOAD_AVG_MAX	归一化可运行占比
+	unsigned long			util_avg;//util_sum / LOAD_AVG_MAX	归一化CPU利用率
+	unsigned int			util_est; //EMA(util_avg)	快速利用率估算（指数移动平均）
 } ____cacheline_aligned;
 
 /*
@@ -535,34 +564,42 @@ struct sched_statistics {
 #endif /* CONFIG_SCHEDSTATS */
 } ____cacheline_aligned;
 
+/*
+调度实体
+sched_entity性能调优参数
+字段	          调整方法	                         影响范围
+load.weight	   nice值修改（用户空间）	             进程优先级
+slice	       /proc/sys/kernel/sched_latency_ns	时间片长度
+min_vruntime	内核自动维护	                     防止饥饿
+*/
 struct sched_entity {
 	/* For load-balancing: */
-	struct load_weight		load;
-	struct rb_node			run_node;
-	u64				deadline;
-	u64				min_vruntime;
+	struct load_weight		load; //类型是struct load_weight，用于负载均衡。包含权重信息，影响进程获取CPU时间的比例。需要解释权重如何影响调度优先级。进程权重，由优先级计算得出，决定CPU时间分配比例
+	struct rb_node			run_node;//红黑树节点，用于CFS的运行队列。说明进程在红黑树中的位置，基于vruntime排序。红黑树节点，用于在CFS运行队列中按vruntime排序
+	u64				deadline;//可能和调度截止时间有关，用于确保进程在特定时间内被调度。动态调度截止时间（用于EDF算法扩展）
+	u64				min_vruntime;//跟踪该实体所在队列的最小虚拟运行时间，帮助维护红黑树的正确性。维护当前运行队列的最小虚拟运行时间基准值
 
-	struct list_head		group_node;
-	unsigned int			on_rq;
+	struct list_head		group_node;//：链表节点，用于将调度实体分组，比如在组调度中。
+	unsigned int			on_rq;//表示实体是否在运行队列中，帮助调度器快速判断状态。标记实体是否在运行队列（0/1）
 
-	u64				exec_start;
-	u64				sum_exec_runtime;
-	u64				prev_sum_exec_runtime;
-	u64				vruntime;
-	s64				vlag;
-	u64				slice;
+	u64				exec_start;//记录最后一次开始执行的时间点，用于计算运行时间。纳秒
+	u64				sum_exec_runtime;//累计的实际运行时间，用于统计和比较。∑(exec_start差值) 进程生命周期总实际运行时间
+	u64				prev_sum_exec_runtime;//保存之前的累计时间，可能用于时间片计算。 纳秒 上次从运行队列中取出时保存的运行时间
+	u64				vruntime;//：虚拟运行时间，核心字段，决定调度顺序（CFS核心算法依据）。sum_exec_runtime * 1024 / load.weight
+	s64				vlag;//延迟补偿值，解决新创建进程的vruntime跳跃问题
+	u64				slice;//当前时间片剩余时长 CONFIG_SCHED_CORE
 
-	u64				nr_migrations;
+	u64				nr_migrations;//统计进程跨CPU迁移次数（用于负载均衡优化）CONFIG_SMP
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
-	int				depth;
-	struct sched_entity		*parent;
+	int				depth; //组嵌套深度	根组为0，子组递增
+	struct sched_entity		*parent; //指向父调度实体，构建树状调度层级。
 	/* rq on which this entity is (to be) queued: */
-	struct cfs_rq			*cfs_rq;
+	struct cfs_rq			*cfs_rq; //实体所属的CFS运行队列。连接实体与运行队列
 	/* rq "owned" by this entity/group: */
-	struct cfs_rq			*my_q;
+	struct cfs_rq			*my_q; //子队列指针 当实体代表任务组时有效
 	/* cached value of my_q->h_nr_running */
-	unsigned long			runnable_weight;
+	unsigned long			runnable_weight; //缓存子队列总权重,优化调度决策速度
 #endif
 
 #ifdef CONFIG_SMP
@@ -573,24 +610,60 @@ struct sched_entity {
 	 * collide with read-mostly values above.
 	 */
 	struct sched_avg		avg;
+	/*
+	struct sched_avg {
+	u64				last_update_time; 最后一次更新负载的时间戳（纳秒
+	u64				load_sum; 衰减累计负载（含权重）
+	u64				runnable_sum; 衰减累计可运行时间
+	u32				util_sum; 衰减累计实际利用率
+	u32				period_contrib; 未完成时间窗口的贡献值
+	unsigned long			load_avg;
+	unsigned long			runnable_avg;
+	unsigned long			util_avg;
+	unsigned int			util_est;
+} ____cacheline_aligned;
+	*/
+
 #endif
 };
 
-struct sched_rt_entity {
-	struct list_head		run_list;
-	unsigned long			timeout;
-	unsigned long			watchdog_stamp;
-	unsigned int			time_slice;
-	unsigned short			on_rq;
-	unsigned short			on_list;
 
-	struct sched_rt_entity		*back;
+/*
+1. 时间片管理（SCHED_RR）
+// 内核源码片段 (kernel/sched/rt.c)
+if (rt_task->sched_class == &rt_sched_class) {
+    if (--rt_se->time_slice == 0) {
+        dequeue_task_rt(rq, rt_task, 0);
+        rt_se->timeout = jiffies + rt_rq->rt_runtime;
+    }
+}
+2. 运行队列操作
+sequenceDiagram
+    participant Enqueue
+    participant Dequeue
+    participant Run
+    
+    Enqueue->>Run: list_add_tail(&rt_se->run_list, rt_rq->active.queues + prio)
+    Dequeue->>Run: list_del_init(&rt_se->run_list)
+    Run->>Run: update rt_rq->rt_nr_running
+
+*/
+
+struct sched_rt_entity {
+	struct list_head		run_list; //实时任务在运行队列中的链表节点
+	unsigned long			timeout; //任务的时间片到期时间（jiffies单位）,可能用于记录任务何时需要被重新调度或检查超时。比如在SCHED_RR策略中，时间片用完时触发超时。
+	unsigned long			watchdog_stamp; //最后一次进入运行队列的时间戳,看门狗时间戳，可能与实时任务的看门狗机制相关，用于检测任务是否在规定时间内得到调度，避免优先级反转或死锁。
+	unsigned int			time_slice; //剩余时间片（毫秒，仅对SCHED_RR有效）
+	unsigned short			on_rq; //标记实体是否在运行队列（0/1）
+	unsigned short			on_list; //标记实体是否在运行队列链表（0/1）
+
+	struct sched_rt_entity		*back; //多级队列中指向前一个实体的指针
 #ifdef CONFIG_RT_GROUP_SCHED
-	struct sched_rt_entity		*parent;
+	struct sched_rt_entity		*parent; //指向父调度实体（组调度树结构）
 	/* rq on which this entity is (to be) queued: */
-	struct rt_rq			*rt_rq;
+	struct rt_rq			*rt_rq; //实体所属的实时运行队列
 	/* rq "owned" by this entity/group: */
-	struct rt_rq			*my_q;
+	struct rt_rq			*my_q; //实体拥有的子队列（当实体代表任务组时）
 #endif
 } __randomize_layout;
 
@@ -753,41 +826,202 @@ struct kmap_ctrl {
 #endif
 };
 
+/*
+它包含了进程的所有信息，比如状态、调度参数、内存管理、文件系统、信号处理等
+*/
+
 struct task_struct {
-#ifdef CONFIG_THREAD_INFO_IN_TASK
+#ifdef CONFIG_THREAD_INFO_IN_TASK  //传统布局 (未启用 CONFIG_THREAD_INFO_IN_TASK) 现代布局 (启用 CONFIG_THREAD_INFO_IN_TASK)
 	/*
 	 * For reasons of header soup (see current_thread_info()), this
 	 * must be the first element of task_struct.
+	 * struct thread_info {
+       unsigned long   flags;      // 低层状态标志 TIF_NEED_RESCHED（需要调度）TIF_SIGPENDING（信号待处理）等，  原子操作优化 更新flags时使用set_bit()/clear_bit()保证原子性 set_tsk_thread_flag(current, TIF_NEED_RESCHED);
+       int             preempt_count;  // 抢占计数器  PREEMPT_MASK=0x000000ff SOFTIRQ_MASK=0x0000ff00 等
+       mm_segment_t    addr_limit; // 地址空间限制 USER_DS=0  KERNEL_DS=~0UL
+       struct task_struct *task;   // 关联的task_struct指针 
+	   
+     架构相关字段... 
+     };
+
+	核心作用
+	1. 快速访问当前任务
+	通过 current_thread_info() 宏可直接获取当前线程的thread_info
+	示例代码：
+	C
+	#define current_thread_info() ((struct thread_info *)current_stack_pointer)
+	2. 存储体系架构关键信息
+	x86_64：保存CR3寄存器值（页表基地址）
+	ARM：保存处理器模式（用户态/内核态）
+	RISC-V：保存异常处理上下文
+	3. 管理内核抢占状态
+	preempt_count 字段：
+	Bit 0-7: 抢占禁用计数器（每调用一次preempt_disable()加1）
+	Bit 8-15: 软中断禁用计数
+	Bit 16-23: 硬中断嵌套层级
+	Bit 24-27: 非屏蔽中断(NMI)计数
+	4. 地址空间隔离
+	addr_limit 字段：
+	KERNEL_DS: 允许访问内核空间
+	USER_DS: 限制访问用户空间
+	通过 set_fs() 和 get_fs() 操作
 	 */
+
 	struct thread_info		thread_info;
 #endif
+/* __state
+作用：表示进程的 当前调度状态，是内核调度器的核心状态标识
+主要状态值：
+C
+#define TASK_RUNNING        0x0000  // 可运行 (正在运行或在运行队列)
+#define TASK_INTERRUPTIBLE  0x0001  // 可中断睡眠 (等待信号或资源)
+#define TASK_UNINTERRUPTIBLE 0x0002 // 不可中断睡眠 (等待硬件操作)
+#define __TASK_STOPPED      0x0004  // 进程被暂停 (收到SIGSTOP等信号)
+#define __TASK_TRACED       0x0008  // 进程被调试器跟踪
+操作方式：
+C
+set_current_state(TASK_INTERRUPTIBLE); // 设置当前进程状态
+*/
 	unsigned int			__state;
 
-	/* saved state for "spinlock sleepers" */
+/* saved state for "spinlock sleepers" */
+/* saved_state
+作用：在 自旋锁睡眠场景 中临时保存进程状态
+使用场景：
+当进程因持有自旋锁而无法进入睡眠时，内核会通过类似以下逻辑处理：
+C
+spin_lock(&lock);
+current->saved_state = current->__state;
+current->__state = TASK_UNINTERRUPTIBLE;
+spin_unlock(&lock);
+schedule(); // 主动让出CPU
+*/
 	unsigned int			saved_state;
 
-	/*
-	 * This begins the randomizable portion of task_struct. Only
-	 * scheduling-critical items should be added above here.
-	 */
+
+/*
+* This begins the randomizable portion of task_struct. Only
+* scheduling-critical items should be added above here.*/
+/*结构体布局安全 	randomized_struct_fields_start
+作用：标记结构体字段 随机化布局起始点
+安全机制：
+启用 CONFIG_GCC_PLUGIN_RANDSTRUCT 时，其后的字段内存偏移会被随机化
+防止攻击者利用结构体布局的确定性进行内存攻击
+设计约束：
+调度关键字段必须放在此标记之前，避免随机化影响性能
+	 */	
 	randomized_struct_fields_start
 
-	void				*stack;
+/*内核栈与引用计数
+作用：指向进程的 内核态栈空间
+内存布局：
+Text
+高地址
++-----------------+
+| 内核栈          | <-- stack指针指向这里
++-----------------+
+| struct thread_info | 
++-----------------+
+关键操作：
+C
+#define current ((struct task_struct *)current_thread_info()->task)
+*/	
+	void				*stack; //内核栈地址
+
+/*
+作用：进程描述符的 引用计数器
+操作接口：
+C
+get_task_struct(task);  // usage++
+put_task_struct(task);  // if (--usage == 0) 释放资源
+典型场景：
+fork() 创建子进程时增加父进程的引用计数
+ptrace() 跟踪进程时维持目标进程的引用
+*/
 	refcount_t			usage;
-	/* Per task flags (PF_*), defined further below: */
+
+
+/* Per task flags (PF_*), defined further below: */
+/*
+作用：存储进程的 全局行为标志（PF_*系列）
+关键标志：
+C
+#define PF_EXITING      0x00000004  // 进程正在退出
+#define PF_NOFREEZE     0x00008000  // 禁止进程被挂起 (电源管理)
+#define PF_KTHREAD      0x00200000  // 内核线程标志
+#define PF_MEMALLOC     0x00000800  // 进程正在执行内存分配
+*/
 	unsigned int			flags;
+
+
+/*
+作用：记录 进程跟踪状态（PTRACE_*系列）
+关键标志：
+C
+#define PT_PTRACED      0x00000001  // 进程正在被ptrace跟踪
+#define PT_TRACE_EXEC   0x00000008  // 跟踪execve系统调用
+#define PT_SUSPENDED    0x00000020  // 进程被调试器暂停
+*/	
 	unsigned int			ptrace;
 
+
+/*
+条件编译：仅在 CONFIG_MEM_ALLOC_PROFILING 启用时存在
+作用：关联 内存分配标签，用于统计和调试内存使用
+应用场景：
+C
+// 示例：跟踪kmalloc调用
+DEFINE_ALLOC_TAG(my_tag);
+void *p = kmalloc(size, GFP_KERNEL, &my_tag);
+*/
 #ifdef CONFIG_MEM_ALLOC_PROFILING
 	struct alloc_tag		*alloc_tag;
 #endif
 
+
+//多核调度优化
 #ifdef CONFIG_SMP
+/*
+作用：标记进程 当前是否在CPU上运行
+-1：不在任何CPU运行
+0~N-1：正在对应编号的CPU运行
+原子操作：
+C
+this_cpu_write(task->on_cpu, cpu);  // 设置运行CPU
+*/
 	int				on_cpu;
+
+/*
+作用：用于 唤醒队列 的链表节点
+数据结构：
+C
+struct __call_single_node {
+    struct llist_node node;  // 无锁链表节点
+    void (*func)(void *);    // 唤醒回调函数
+};
+*/
 	struct __call_single_node	wake_entry;
+
+
+/*
+作用：记录 唤醒关系历史，优化负载均衡
+wakee_flips：记录唤醒目标CPU的切换次数
+wakee_flip_decay_ts：最后一次切换的时间戳
+衰减算法：if (now - ts > 1s) wakee_flips = wakee_flips * 7 / 8; // 指数衰减
+*/
 	unsigned int			wakee_flips;
 	unsigned long			wakee_flip_decay_ts;
+
+/*
+作用：指向 最后一次被当前任务唤醒的任务
+优化场景：
+C
+// 在try_to_wake_up()中优先选择上次唤醒的CPU
+if (last_wakee && cpus_share_cache(cpu, last_wakee->wake_cpu))
+    target_cpu = last_wakee->wake_cpu;
+*/
 	struct task_struct		*last_wakee;
+
 
 	/*
 	 * recent_used_cpu is initially set as the last CPU used by a task
@@ -796,28 +1030,204 @@ struct task_struct {
 	 * Tracking a recently used CPU allows a quick search for a recently
 	 * used CPU that may be idle.
 	 */
+/*
+int recent_used_cpu 与 int wake_cpu
+作用：缓存 最近使用的CPU编号
+recent_used_cpu：最近运行过的CPU（用于快速搜索空闲CPU）
+wake_cpu：计划唤醒的目标CPU
+更新策略：
+C
+// 在上下文切换时更新
+prev->recent_used_cpu = cpu;
+next->wake_cpu = cpu;
+*/
 	int				recent_used_cpu;
 	int				wake_cpu;
 #endif
+
+/*
+作用：标识进程 是否在运行队列中
+0：不在任何运行队列
+1：在运行队列中等待调度
+操作示例：
+C
+// 将任务加入运行队列
+enqueue_task(rq, p, flags);
+p->on_rq = 1;
+
+// 从运行队列移除
+dequeue_task(rq, p, flags);
+p->on_rq = 0;
+*/
 	int				on_rq;
 
+
+
+/*
+int prio
+动态优先级：
+范围：0 (最高) ~ 139 (最低)
+实时任务：MAX_RT_PRIO-1 (99) ~ 0
+普通任务：100 ~ 139
+计算方式：
+C
+prio = effective_prio(p); // 综合考虑static_prio和交互性
+*/
 	int				prio;
+
+
+/*
+静态优先级：
+初始值由 nice值 转换：nice + 120
+范围：100 (对应nice=-20) ~ 139 (对应nice=19)
+通过 set_user_nice() 修改
+*/	
 	int				static_prio;
+
+
+/*
+归一化优先级：
+根据调度策略自动计算
+计算规则：
+C
+if (policy == SCHED_NORMAL) 
+    normal_prio = static_prio;
+else if (policy == SCHED_FIFO || SCHED_RR)
+    normal_prio = MAX_RT_PRIO-1 - rt_priority; 
+*/	
 	int				normal_prio;
+
+
+/*
+unsigned int rt_priority
+实时优先级：
+范围：0 (最低) ~ 99 (最高)
+仅对 SCHED_FIFO/SCHED_RR 有效
+通过 sched_setparam() 修改
+*/	
 	unsigned int			rt_priority;
 
-	struct sched_entity		se;
+/*
+CFS调度实体：
+核心字段：
+C
+u64 vruntime;          // 虚拟运行时间
+u64 exec_start;        // 当前时间片开始时间
+struct load_weight load; // 权重 (由优先级计算)
+调度策略：
+在红黑树中按 vruntime 排序
+权重决定时间片比例：time_slice = period * weight / total_weight
+*/	
+	struct sched_entity		se;  
+
+/*
+实时调度实体：
+核心字段：
+C
+unsigned long timeout;   // 时间片到期时间
+struct list_head run_list; // 运行队列链表节点
+调度策略：
+SCHED_FIFO：无时间片，直到主动让出CPU
+SCHED_RR：轮转时间片 (默认100ms)
+*/	
 	struct sched_rt_entity		rt;
+
+/*
+Deadline调度实体：
+核心字段：
+C
+u64 deadline;       // 绝对截止时间
+u64 runtime;        // 剩余执行时间配额
+u64 period;         // 任务周期
+调度策略：
+使用 Earliest Deadline First (EDF) 算法
+保证在 deadline 前分配 runtime 时间
+*/	
 	struct sched_dl_entity		dl;
+
+/*
+调度类指针：
+指向的调度类：
+C
+idle_sched_class    // IDLE任务
+fair_sched_class    // CFS调度
+rt_sched_class      // 实时调度
+dl_sched_class      // Deadline调度
+stop_sched_class    // 停机线程
+关键操作：
+C
+.enqueue_task()     // 入队
+.dequeue_task()     // 出队
+.pick_next_task()   // 选择下一个任务
+*/	
 	struct sched_dl_entity		*dl_server;
+
+/*
+调度类指针：
+指向的调度类：
+C
+idle_sched_class    // IDLE任务
+fair_sched_class    // CFS调度
+rt_sched_class      // 实时调度
+dl_sched_class      // Deadline调度
+stop_sched_class    // 停机线程
+关键操作：
+C
+.enqueue_task()     // 入队
+.dequeue_task()     // 出队
+.pick_next_task()   // 选择下一个任务
+*/	
 	const struct sched_class	*sched_class;
 
 #ifdef CONFIG_SCHED_CORE
+/*
+作用：在 核心调度树 中的节点
+应用场景：
+当启用 CONFIG_SCHED_CORE 时，用于跨CPU核心的任务分组调度
+通过红黑树实现快速任务选择
+*/
 	struct rb_node			core_node;
+
+/*
+核心标识符：
+相同 core_cookie 的任务被视为同一调度组
+用于实现 协同调度 (Co-Scheduling)
+*/	
 	unsigned long			core_cookie;
+
+/*
+核心占用计数：
+记录调度组在当前核心上的任务数
+用于负载均衡决策
+*/	
 	unsigned int			core_occupation;
 #endif
 
+/*
+作用：指向 任务所属的调度控制组  控制组是Linux内核的一个功能，用于资源限制、分配和统计。在调度方面，控制组调度属于CPU子系统的一部分，用于控制不同任务组对CPU资源的使用。
+关键功能：
+控制组的CPU时间配额 (cpu.shares)
+实时任务带宽限制 (rt_runtime_us)
+CFS带宽控制 (cpu.cfs_period_us + cpu.cfs_quota_us)
+1. CFS带宽控制
+参数：
+echo 100000 > cpu.cfs_period_us  # 100ms周期
+echo 50000 > cpu.cfs_quota_us    # 50ms配额 (限速50% CPU)
+实现逻辑：
+// 内核源码 (kernel/sched/fair.c)
+if (group_runtime_remaining(tg) <= 0) {
+    throttle_cfs_rq(tg->cfs_rq); // 限制组内任务运行
+}
+2. 实时任务限流
+参数：
+echo 1000000 > cpu.rt_period_us  # 1秒周期
+echo 200000 > cpu.rt_runtime_us  # 200ms配额 (限速20% CPU)
+实现逻辑：
+// 内核源码 (kernel/sched/rt.c)
+if (rt_rq->rt_time > rt_rq->rt_runtime) {
+    dequeue_rt_entity(rt_se);    // 移出运行队列
+}
+*/
 #ifdef CONFIG_CGROUP_SCHED
 	struct task_group		*sched_task_group;
 #endif
@@ -828,11 +1238,39 @@ struct task_struct {
 	 * Clamp values requested for a scheduling entity.
 	 * Must be updated with task_rq_lock() held.
 	 */
+/*
+	请求的利用率限制：uclamp_req保存了用户空间或任务自己请求的利用率限制，而uclamp是经过系统范围限制调整后的实际生效值
+例如，用户可能请求最小利用率50%，但系统全局设置的最小值为30%，那么实际生效的会是50%。但如果用户请求的是20%，系统下限是30%，那么实际生效的是30%
+举例：
+为浏览器进程设置最低 30% 利用率保障  echo "30" > /sys/fs/cgroup/cpu/browser/cpu.uclamp.min
+限制日志服务最多使用 20% CPU  echo "20" > /sys/fs/cgroup/cpu/logger/cpu.uclamp.max
+在手机等设备上限制非焦点任务 echo "10" > /sys/fs/cgroup/cpu/background/cpu.uclamp.max
+查看实时利用率  cat /proc/<pid>/sched | grep "util_avg" 输出示例： se.avg.util_avg       : 623   # 当前平均利用率≈60.8%
+索引：
+UCLAMP_MIN = 0  // 最小利用率下限
+UCLAMP_MAX = 1  // 最大利用率上限
+取值范围：0 (0%) ~ 1024 (100%)
+设置接口：
+C
+sched_setattr(p, &(struct sched_attr){
+    .sched_flags = SCHED_FLAG_UTIL_CLAMP,
+    .sched_util_min = 512,  // 50%
+    .sched_util_max = 768   // 75%
+});
+*/
 	struct uclamp_se		uclamp_req[UCLAMP_CNT];
+	
 	/*
 	 * Effective clamp values used for a scheduling entity.
 	 * Must be updated with task_rq_lock() held.
 	 */
+/*
+生效的利用率限制：
+考虑系统级默认值 (sysctl_sched_uclamp_util_{min,max})
+计算公式：
+effective_min = max(task_req_min, system_min)
+effective_max = min(task_req_max, system_max)
+*/
 	struct uclamp_se		uclamp[UCLAMP_CNT];
 #endif
 
